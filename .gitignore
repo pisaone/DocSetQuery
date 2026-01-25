@@ -48,3 +48,6 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 *.dSYM
+
+# Local working directory
+local/

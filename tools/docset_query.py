@@ -83,7 +83,8 @@ class DocsetClient:
         prefix = prefix.rstrip("/")
         if not prefix:
             prefix = "/"
-        return prefix
+        # Apple DocSet internal paths are lowercase.
+        return prefix.lower()
 
     def generate_markdown(
         self, root_path: str, max_depth: Optional[int] = None
@@ -93,10 +94,34 @@ class DocsetClient:
         entries = self._index_prefix(prefix)
         if not entries:
             raise RuntimeError(f"No documents found for prefix {prefix!r}")
+        print(f"[docset] Found {len(entries)} documents matching prefix {prefix!r}", file=sys.stderr)
 
         root_entry = self._find_root(entries, prefix)
         if not root_entry:
-            raise RuntimeError(f"Root document for {prefix!r} not found in indexed entries.")
+            if entries:
+                print(f"[docset] Root not found for {prefix!r}. Creating virtual root from {len(entries)} entries.", file=sys.stderr)
+                sorted_ids = sorted(entries.keys(), key=lambda k: entries[k].primary_path(self.language) or k)
+
+                fake_doc = {
+                    "metadata": {"title": prefix.split("/")[-1], "role": "collection"},
+                    "identifier": {"url": "virtual_root"},
+                    "topicSections": [
+                        {"title": "All Symbols", "identifiers": sorted_ids}
+                    ],
+                    "references": {}
+                }
+
+                root_entry = DocumentEntry(
+                    identifier="virtual_root",
+                    uuid="virtual_root",
+                    data_id=0,
+                    offset=0,
+                    length=0,
+                    doc=fake_doc
+                )
+                entries["virtual_root"] = root_entry
+            else:
+                raise RuntimeError(f"Root document for {prefix!r} not found in indexed entries.")
 
         print(f"[docset] Traversing graph starting at {root_entry.identifier}", file=sys.stderr)
         traversal = self._traverse(entries, root_entry.identifier, prefix, max_depth=max_depth)
@@ -162,11 +187,48 @@ class DocsetClient:
 
     # -------------------- indexing helpers --------------------
 
+    def _has_prefix_in_index(self, prefix: str) -> bool:
+        """
+        Quickly check if the given prefix exists in the docSet.dsidx search index.
+        This avoids scanning the massive cache.db refs table for non-existent paths.
+        """
+        idx_path = self.docset_root / "Contents" / "Resources" / "docSet.dsidx"
+        if not idx_path.exists():
+            return True  # Fallback to full scan if index is missing
+
+        # Dash index paths usually contain 'request_key=ls<path>' or just the path.
+        # We query for the path appearing anywhere to be safe, but bounded by the standard prefix.
+        # Using a broad LIKE pattern is still much faster than scanning 300MB+ of JSON blobs.
+
+        # Remove trailing slash for broader match, but ensure leading slash
+        search_term = prefix.rstrip("/")
+        if not search_term:
+            return True
+
+        query = "SELECT 1 FROM searchIndex WHERE path LIKE ? LIMIT 1"
+        # LOWERCASE the pattern to match standard docset indexing behavior
+        pattern = f"%{search_term.lower()}%"
+
+        try:
+            conn = sqlite3.connect(idx_path)
+            cursor = conn.execute(query, (pattern,))
+            result = cursor.fetchone()
+            conn.close()
+            return result is not None
+        except Exception as e:
+            print(f"[docset] Warning: Index check failed ({e}), falling back to full scan.", file=sys.stderr)
+            return True
+
     def _index_prefix(self, prefix: str) -> Dict[str, DocumentEntry]:
         cached = self._load_manifest(prefix)
         if cached is not None:
             print(f"[docset] Loaded cached manifest for {prefix}", file=sys.stderr)
             return cached
+
+        # Optimization: Check if the prefix exists in the Dash index before scanning the full refs table.
+        if not self._has_prefix_in_index(prefix):
+             print(f"[docset] Optimization: Prefix {prefix!r} not found in docSet.dsidx. Skipping scan.", file=sys.stderr)
+             return {}
 
         entries: Dict[str, DocumentEntry] = {}
         self.path_index = {}
@@ -190,6 +252,7 @@ class DocsetClient:
                 continue
             paths_by_language: Dict[str, List[str]] = {}
             include = False
+            all_paths = set()
             for variant in doc.get("variants", []):
                 langs = {
                     trait.get("interfaceLanguage")
@@ -197,14 +260,27 @@ class DocsetClient:
                     if trait.get("interfaceLanguage")
                 }
                 paths = [p for p in variant.get("paths", []) if isinstance(p, str)]
+                all_paths.update(paths)
                 for lang in langs:
                     paths_by_language.setdefault(lang, []).extend(paths)
-                if paths and any(
-                    (lang == self.language or lang is None) and path.startswith(prefix)
-                    for lang in (langs or {None})
-                    for path in paths
-                ):
+
+            # Include if ANY path variant matches the prefix.
+            # We filter by language later during rendering/traversal.
+            if any(path.lower().startswith(prefix) for path in all_paths):
+                include = True
+
+            # Fallback: Check identifier URL if paths didn't match.
+            # Strip the protocol and domain (e.g. doc://com.apple.gamekit) to get the path.
+            if not include:
+                ident_path = identifier.lower()
+                if "://" in ident_path:
+                    ident_path = "/" + ident_path.split("://", 1)[1].split("/", 1)[-1]
+                if ident_path.startswith(prefix):
                     include = True
+                    # Fallback: Add derived path to paths_by_language
+                    lang = doc.get("identifier", {}).get("interfaceLanguage", "swift")
+                    paths_by_language.setdefault(lang, []).append(ident_path)
+
             if include:
                 entries[identifier] = DocumentEntry(
                     identifier=identifier,
@@ -217,11 +293,11 @@ class DocsetClient:
                 )
                 preferred_paths = paths_by_language.get(self.language) or []
                 for path in preferred_paths:
-                    self.path_index[path] = identifier
+                    self.path_index[path.lower().rstrip('/')] = identifier
                 if not preferred_paths:
                     for path_list in paths_by_language.values():
                         for path in path_list:
-                            self.path_index.setdefault(path, identifier)
+                            self.path_index.setdefault(path.lower().rstrip('/'), identifier)
             processed += 1
             if processed % 50000 == 0:
                 print(f"  indexed {processed} records...", file=sys.stderr)
@@ -231,7 +307,13 @@ class DocsetClient:
     def _find_root(self, entries: Dict[str, DocumentEntry], prefix: str) -> Optional[DocumentEntry]:
         for entry in entries.values():
             path = entry.primary_path(self.language)
-            if path == prefix:
+            if path and path.lower() == prefix:
+                return entry
+            # Fallback for entries with missing or mismatched primary paths
+            ident_path = entry.identifier.lower()
+            if "://" in ident_path:
+                ident_path = "/" + ident_path.split("://", 1)[1].split("/", 1)[-1]
+            if ident_path == prefix:
                 return entry
         return None
 
@@ -272,6 +354,10 @@ class DocsetClient:
                 )
                 entries_map[entry.identifier] = entry
 
+            if not entries_map:
+                # Treat empty cache as no cache to allow re-indexing
+                return None
+
             if candidate != prefix:
                 filtered: Dict[str, DocumentEntry] = {}
                 for entry in entries_map.values():
@@ -294,11 +380,11 @@ class DocsetClient:
                 for lang, paths in entry.paths_by_language.items():
                     if self.language == lang:
                         for path_value in paths:
-                            self.path_index[path_value] = entry.identifier
+                            self.path_index[path_value.lower().rstrip('/')] = entry.identifier
                 if self.language not in entry.paths_by_language:
                     for paths in entry.paths_by_language.values():
                         for path_value in paths:
-                            self.path_index.setdefault(path_value, entry.identifier)
+                            self.path_index.setdefault(path_value.lower().rstrip('/'), entry.identifier)
             return entries_map
         return None
 
@@ -354,7 +440,7 @@ class DocsetClient:
                     url = ref.get("url") if ref else ""
                     target_identifier = None
                     if url:
-                        target_identifier = self.path_index.get(url)
+                        target_identifier = self.path_index.get(url.lower().rstrip('/'))
                     if not target_identifier and child_id in entries:
                         target_identifier = child_id
                     if not target_identifier:
