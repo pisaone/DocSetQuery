@@ -4,6 +4,8 @@
 
 Local-first Apple documentation extraction, cleanup, and search. Built for fast developer lookup and agent workflows that need deterministic, citeable Markdown instead of scraping the web.
 
+[🇯🇵 日本語ドキュメント (Japanese Documentation)](local/README_JP.md)
+
 This repo is a working toolkit and a work in progress. Not all planned features are fully implemented yet. It assumes you already have the Apple API Reference docset (Dash docset) on disk and a `brotli` CLI available.
 
 ## Why this exists
@@ -12,8 +14,9 @@ This repo is a working toolkit and a work in progress. Not all planned features 
 - Local search should be instant, without re-reading docsets for every query.
 
 ## What you get
-- `tools/docset_query.py` — exports DocC content from the Apple docset to Markdown.
+- `tools/docset_query.py` — exports DocC content from the Apple docset to Markdown (includes Dash index optimizations).
 - `tools/docset_sanitize.py` — rebuilds front matter + trims the TOC for cleaner context.
+- `local/sanitize.py` — batches sanitization for all Markdown files in `docs/apple`.
 - `tools/docindex.py` — builds a local JSON index for fast search by heading/key sections.
 - `tools/docmeta.py` — peeks front matter/TOC quickly for debugging.
 - `scripts/sync_docs.sh` — syncs a canonical docs cache into `docs/apple` (repo cache is gitignored).
@@ -105,3 +108,11 @@ Planned (not implemented):
 ## Future (not implemented)
 - Add a small helper that reads Kapeli’s feed metadata and downloads vendor docsets automatically.
 - Cache and unpack docsets into a consistent local location so agents can bootstrap a repo quickly.
+
+---
+
+## Fork Improvements (v2.x)
+- **Search Index Optimization**: Added pre-traversal check against `docSet.dsidx` in `tools/docset_query.py`, drastically reducing wait times for non-existent or narrow symbol lookups.
+- **Improved Normalization**: Case-insensitive path matching and trailing slash handling for reliable exports.
+- **Batch Processing**: Added `local/sanitize.py` to clean up the entire local documentation cache at once.
+- **Localization**: Added comprehensive Japanese guide in `local/README_JP.md`.
